@@ -80,14 +80,19 @@ def tight_bbox(digit, orig_bbox):
 
 
 def dataset_exists(dirpath: pathlib.Path, num_images):
-    if not dirpath.is_dir():
+    # dirpath is expected to be base/<split>; real image dir will be base/images/<split>
+    parent = dirpath.parent
+    split = dirpath.name
+    image_dir = parent.joinpath("images", split)
+    label_dir = parent.joinpath("labels", split)
+    if not image_dir.is_dir() or not label_dir.is_dir():
         return False
     for image_id in range(num_images):
         error_msg = f"MNIST dataset already generated in {dirpath}, \n\tbut did not find filepath:"
-        error_msg2 = f"You can delete the directory by running: rm -r {dirpath.parent}"
-        impath = dirpath.joinpath("images", f"{image_id}.png")
+        error_msg2 = f"You can delete the directory by running: rm -r {parent}"
+        impath = image_dir.joinpath(f"{image_id}.png")
         assert impath.is_file(), f"{error_msg} {impath} \n\t{error_msg2}"
-        label_path = dirpath.joinpath("labels", f"{image_id}.txt")
+        label_path = label_dir.joinpath(f"{image_id}.txt")
         assert label_path.is_file(),  f"{error_msg} {impath} \n\t{error_msg2}"
     return True
 
@@ -99,16 +104,20 @@ def generate_dataset(dirpath: pathlib.Path,
                      imsize: int,
                      max_digits_per_image: int,
                      mnist_images: np.ndarray,
-                     mnist_labels: np.ndarray):
-    if dataset_exists(dirpath, num_images):
+                     mnist_labels: np.ndarray,
+                     regenerate_dataset: bool):
+    if dataset_exists(dirpath, num_images) and not regenerate_dataset:
         return
     max_image_value = 255
     assert mnist_images.dtype == np.uint8
-    image_dir = dirpath.joinpath("images")
-    label_dir = dirpath.joinpath("labels")
+    # dirpath is base/<split>; create images/<split> and labels/<split>
+    parent = dirpath.parent
+    split = dirpath.name
+    image_dir = parent.joinpath("images", split)
+    label_dir = parent.joinpath("labels", split)
     image_dir.mkdir(exist_ok=True, parents=True)
     label_dir.mkdir(exist_ok=True, parents=True)
-    for image_id in tqdm.trange(num_images, desc=f"Generating dataset, saving to: {dirpath}"):
+    for image_id in tqdm.trange(num_images, desc=f"Generating dataset, saving"):
         im = np.zeros((imsize, imsize), dtype=np.float32)
         labels = []
         bboxes = []
@@ -137,19 +146,24 @@ def generate_dataset(dirpath: pathlib.Path,
         label_target_path = label_dir.joinpath(f"{image_id}.txt")
         im = im.astype(np.uint8)
         cv2.imwrite(str(image_target_path), im)
+        # Write labels in YOLO format: "class x_center y_center width height"
+        # all coordinates normalized to [0,1] relative to image size (imsize)
+        # class equals the digit label
         with open(label_target_path, "w") as fp:
-            fp.write("label,xmin,ymin,xmax,ymax\n")
             for l, bbox in zip(labels, bboxes):
-                bbox = [str(_) for _ in bbox]
-                to_write = f"{l}," + ",".join(bbox) + "\n"
-                fp.write(to_write)
+                xmin, ymin, xmax, ymax = bbox
+                x_center = (xmin + xmax) / 2.0 / imsize
+                y_center = (ymin + ymax) / 2.0 / imsize
+                width = (xmax - xmin) / imsize
+                height = (ymax - ymin) / imsize
+                # YOLO expects: class x_center y_center width height (space-separated, floats)
+                fp.write(f"{l} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n")
 
 
 if __name__ == "__main__":
+    dataset_name = "mnist_object_detection"
+    base_path = f"datasets/{dataset_name}"
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--base-path", default="data/mnist_detection"
-    )
     parser.add_argument(
         "--imsize", default=300, type=int
     )
@@ -163,21 +177,91 @@ if __name__ == "__main__":
         "--num-train-images", default=10000, type=int
     )
     parser.add_argument(
-        "--num-test-images", default=1000, type=int
+        "--num-test-images", default=1000, type=int,
+        help="Number of test images to generate from the MNIST test split"
+    )
+    parser.add_argument(
+        "--val-split", default=0.1, type=float,
+        help="Fraction of the generated train set to use as validation (0..1)"
     )
     parser.add_argument(
         "--max-digits-per-image", default=20, type=int
     )
+    parser.add_argument(
+        "--regenerate-datasets", default=False, type=bool
+    )
     args = parser.parse_args()
     X_train, Y_train, X_test, Y_test = mnist.load()
-    for dataset, (X, Y) in zip(["train", "test"], [[X_train, Y_train], [X_test, Y_test]]):
-        num_images = args.num_train_images if dataset == "train" else args.num_test_images
-        generate_dataset(
-            pathlib.Path(args.base_path, dataset),
-            num_images,
-            args.max_digit_size,
-            args.min_digit_size,
-            args.imsize,
-            args.max_digits_per_image,
-            X,
-            Y) 
+    # Generate train+val (from MNIST train split) and a separate test (from MNIST test split)
+    base = pathlib.Path(base_path)
+
+    # compute train/val split counts
+    if not (0.0 <= args.val_split < 1.0):
+        raise ValueError("--val-split must be in range [0, 1)")
+
+    total = args.num_train_images
+    val_count = int(round(total * args.val_split))
+    train_count = total - val_count
+
+    if train_count <= 0:
+        raise ValueError("val-split too large, no training images would remain")
+
+    print(f"Generating {train_count} train images and {val_count} val images (val_split={args.val_split})")
+
+    generate_dataset(
+        base.joinpath("train"),
+        train_count,
+        args.max_digit_size,
+        args.min_digit_size,
+        args.imsize,
+        args.max_digits_per_image,
+        X_train,
+        Y_train,
+        args.regenerate_datasets
+    )
+
+    generate_dataset(
+        base.joinpath("val"),
+        val_count,
+        args.max_digit_size,
+        args.min_digit_size,
+        args.imsize,
+        args.max_digits_per_image,
+        X_train,
+        Y_train,
+        args.regenerate_datasets
+    )
+
+    # Test dataset from MNIST test split (may be smaller than requested if MNIST test size limit reached)
+    num_test = args.num_test_images
+    max_available = len(X_test)
+    if num_test > max_available:
+        print(f"Requested {num_test} test images but only {max_available} are available in MNIST test split. Reducing to {max_available}.")
+        num_test = max_available
+
+    generate_dataset(
+        base.joinpath("test"),
+        num_test,
+        args.max_digit_size,
+        args.min_digit_size,
+        args.imsize,
+        args.max_digits_per_image,
+        X_test,
+        Y_test,
+        args.regenerate_datasets
+    )
+
+    # Create a dataset YAML index (YOLO-style) at the dataset root
+    dataset_root = base
+    yaml_path = dataset_root.joinpath("data.yaml")
+    names = {i: str(i) for i in range(10)}
+    with open(yaml_path, "w", encoding="utf-8") as yf:
+        yf.write(f"path: {dataset_name}\n")
+        yf.write("train: images/train\n")
+        yf.write("val: images/val\n")
+        yf.write("test: images/test\n")
+        yf.write("\n")
+        yf.write("names:\n")
+        for k, v in names.items():
+            yf.write(f"    {k}: '{v}'\n")
+    print(f"Wrote dataset YAML to: {yaml_path}")
