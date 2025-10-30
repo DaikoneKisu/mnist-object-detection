@@ -15,10 +15,9 @@ filename = [
 ]
 SAVE_PATH = pathlib.Path("data/original_mnist")
 
-
 def download_mnist():
     SAVE_PATH.mkdir(exist_ok=True, parents=True)
-    base_url = "http://yann.lecun.com/exdb/mnist/"
+    base_url = "https://raw.githubusercontent.com/fgnt/mnist/master/"
     for name in filename:
         filepath = SAVE_PATH.joinpath(name[1])
         if filepath.is_file():
